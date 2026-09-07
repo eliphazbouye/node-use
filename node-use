@@ -1,0 +1,423 @@
+#!/usr/bin/env bash
+# node-use - install and switch Node versions without a version manager.
+#
+#   node-use                    list installed versions and the active one
+#   node-use <major|version>    switch to an installed upstream version
+#   node-use system             switch to Fedora's dnf-managed Node
+#
+#   node-use remote [what]      list versions available on nodejs.org
+#                               what: lts | all | <major>   (default: recent)
+#   node-use install <what>     download+verify+install, then switch to it
+#                               what: latest | lts | <major> | <full version>
+#   node-use update             upgrade the active major to its newest release
+#   node-use remove <version>   delete an installed upstream version
+#   node-use prune [--all] [-y] delete superseded builds (dry run unless -y)
+#
+# Upstream builds live in ~/.local/share/node/node-v<ver>-<platform> and are
+# selected by repointing the 'current' symlink. Downloads are verified against
+# nodejs.org's SHASUMS256.txt, whose GPG signature is checked against the
+# official nodejs/release-keys list.
+set -euo pipefail
+
+ROOT="$HOME/.local/share/node"
+BIN="$HOME/.local/bin"
+DIST="${NODE_USE_DIST:-https://nodejs.org/dist}"   # overridable for testing
+KEYSLIST="https://raw.githubusercontent.com/nodejs/release-keys/main/keys.list"
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/node-use"
+INDEX_TTL="${NODE_USE_TTL:-3600}"   # seconds; --refresh forces a re-fetch
+REFRESH=0
+
+case "$(uname -m)" in
+    x86_64)  ARCH=x64 ;;
+    aarch64) ARCH=arm64 ;;
+    armv7l)  ARCH=armv7l ;;
+    ppc64le) ARCH=ppc64le ;;
+    s390x)   ARCH=s390x ;;
+    *) echo "node-use: unsupported architecture $(uname -m)" >&2; exit 1 ;;
+esac
+PLAT="linux-$ARCH"
+
+die()  { echo "node-use: $*" >&2; exit 1; }
+note() { echo "  $*"; }
+
+need() { command -v "$1" >/dev/null 2>&1 || die "requires '$1' but it is not installed"; }
+
+# ---------- remote index ----------------------------------------------------
+
+# Keep a local copy of the release index. This is the single biggest win:
+# the HTTP fetch costs ~115ms while parsing costs ~9ms.
+ensure_index() {
+    need curl
+    local f="$CACHE/index.json" age
+    if [ "$REFRESH" != 1 ] && [ -s "$f" ]; then
+        age=$(( ${EPOCHSECONDS:-$(date +%s)} - $(stat -c %Y "$f") ))
+        [ "$age" -lt "$INDEX_TTL" ] && return 0
+    fi
+    mkdir -p "$CACHE"
+    if curl -fsSL --max-time 60 "$DIST/index.json" -o "$f.tmp" 2>/dev/null; then
+        mv -f "$f.tmp" "$f"
+    else
+        rm -f "$f.tmp"
+        [ -s "$f" ] || die "could not reach nodejs.org and no cached index available"
+        # to stderr: this runs inside a command substitution, so stdout would
+        # be captured into the caller results and corrupt the table
+        note "network unavailable - using cached index from $(date -d "@$(stat -c %Y "$f")" '+%Y-%m-%d %H:%M')" >&2
+    fi
+}
+
+# idx_query <grep-pattern|""> <jq args...>
+# The index is pretty-printed with one release object per line, so when a query
+# only needs a subset we can drop most lines with grep before jq parses them.
+# Falls back to parsing the whole array if the layout is ever not line-per-object.
+idx_query() {
+    local pat="$1"; shift
+    local f="$CACHE/index.json"
+    ensure_index
+    # Cheap layout probe: read just the first two lines with the builtin rather
+    # than counting all 865 with wc (which reads the whole 324KB file).
+    local l1 l2
+    { read -r l1; read -r l2; } < "$f" || true
+    if [ -n "$pat" ] && [ "$l1" = "[" ] && [[ $l2 == \{*\}, ]]; then
+        # one sed does the line filter and the trailing-comma strip together;
+        # a separate grep would cost an extra process (~1ms)
+        sed -nE "/$pat/{s/,\$//;p}" "$f" | jq -s "$@"
+    else
+        jq "$@" "$f"
+    fi
+}
+
+# resolve_spec <spec> -> prints a bare version like 24.20.0
+resolve_spec() {
+    local spec="${1#v}" out
+    need jq
+    if ! [[ $spec == latest || $spec == lts \
+         || $spec =~ ^[0-9]+$ || $spec =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        die "cannot understand version '$spec' (use: latest, lts, a major like 24, or 24.20.0)"
+    fi
+    local pat=""
+    case "$spec" in
+        latest) pat="" ;;
+        lts)    pat='"lts":"' ;;
+        *.*.*)  pat="\"version\":\"v${spec//./\\.}\"" ;;
+        *)      pat="\"version\":\"v${spec}\\." ;;
+    esac
+    out="$(idx_query "$pat" -r --arg spec "$spec" '
+        def ver: .version | ltrimstr("v");
+        def maj: (ver | split(".")[0]);
+        ( if   $spec == "latest" then .[0]
+          elif $spec == "lts"    then ([ .[] | select(.lts) ] | first)
+          elif ($spec | test("^[0-9]+$")) then ([ .[] | select(maj == $spec) ] | first)
+          else ([ .[] | select(ver == $spec) ] | first)
+          end )
+        | if . == null then empty else ver end
+    ')"
+    [ -n "$out" ] || die "no release matches '$spec'"
+    printf '%s\n' "$out"
+}
+
+cmd_remote() {
+    local what="${1:-recent}" inst="" rows
+    need jq
+    # installed versions, passed to jq so it can mark them
+    if compgen -G "$ROOT/node-v*-$PLAT" >/dev/null; then
+        local d b v
+        for d in "$ROOT"/node-v*-"$PLAT"/; do
+            b="${d%/}"; b="${b##*/}"; v="${b#node-v}"; v="${v%-$PLAT}"
+            inst="$inst $v"
+        done
+    fi
+
+    local pat=""
+    case "$what" in
+        lts)        pat='"lts":"' ;;
+        all)        pat="" ;;
+        [0-9]*)     pat="\"version\":\"v${what}\\." ;;
+        *)          pat='"version":"v(1[89]|[2-9][0-9])\.' ;;
+    esac
+    rows="$(idx_query "$pat" -r --arg what "$what" --arg inst "$inst" '
+        def ver:  .version | ltrimstr("v");
+        def maj:  (ver | split(".")[0] | tonumber);
+        def kind: (if .lts then "LTS " + .lts else "Current" end);
+        # NOTE: jq builtin args are filters evaluated against that builtin own
+        # input, so index(ver) would run .version against the split array.
+        # Bind the value to a variable first.
+        def mark: (ver) as $v
+                | (if ($inst | split(" ") | index($v)) then "installed" else "" end);
+
+        ( if   $what == "lts" then
+              [ .[] | select(.lts) ] | group_by(.lts) | map(.[0]) | sort_by(maj) | reverse
+          elif $what == "all" then
+              .[0:60]
+          elif ($what | test("^[0-9]+$")) then
+              [ .[] | select(maj == ($what | tonumber)) ] | .[0:25]
+          else
+              [ .[] | select(maj >= 18) ] | group_by(maj) | map(.[0]) | reverse
+          end )
+        | .[]
+        | [ ver, .date, (.npm // "-"), kind, mark ] | @tsv
+    ')"
+
+    [ -n "$rows" ] || die "no releases match '$what'"
+    { printf 'VERSION\tRELEASED\tNPM\tLINE\t\n'; printf '%s\n' "$rows"; } \
+        | awk -F'\t' '{ printf "  %-11s %-12s %-9s %-14s %s\n", $1, $2, $3, $4, $5 }'
+    echo
+    note "install with:  node-use install <version|major|lts|latest>"
+}
+
+# ---------- verification ----------------------------------------------------
+
+import_key() {
+    local key="$1"
+    curl -fsSL --max-time 30 "$KEYSLIST" 2>/dev/null | grep -qi "^$key$" \
+        || { echo "     key $key is NOT on the official release-keys list" >&2; return 1; }
+    for ks in hkps://keys.openpgp.org hkps://keyserver.ubuntu.com; do
+        timeout 45 gpg --quiet --keyserver "$ks" --recv-keys "$key" >/dev/null 2>&1 && return 0
+    done
+    return 1
+}
+
+verify() {
+    local dir="$1"
+    local ver="$2"
+    local tar="node-v$ver-$PLAT.tar.xz"
+
+    ( cd "$dir" && sha256sum --ignore-missing -c SHASUMS256.txt 2>/dev/null | grep -q "$tar: OK" ) \
+        || die "SHA-256 mismatch for $tar - refusing to install"
+    note "sha256 ....... OK"
+
+    if ! command -v gpg >/dev/null 2>&1; then
+        note "gpg .......... skipped (gpg not installed)"; return 0
+    fi
+    local out key
+    out="$(cd "$dir" && gpg --verify SHASUMS256.txt.asc 2>&1 || true)"
+    if ! grep -q "Good signature" <<<"$out"; then
+        key="$(grep -oE '[A-F0-9]{40}' <<<"$out" | head -1 || true)"
+        if [ -n "$key" ] && import_key "$key"; then
+            out="$(cd "$dir" && gpg --verify SHASUMS256.txt.asc 2>&1 || true)"
+        fi
+    fi
+    if grep -q "Good signature" <<<"$out"; then
+        local who; who="$(grep -oP 'Good signature from "\K[^"]+' <<<"$out" | head -1)"
+        key="$(grep -oE '[A-F0-9]{40}' <<<"$out" | head -1 || true)"
+        if [ -n "$key" ] && curl -fsSL --max-time 30 "$KEYSLIST" 2>/dev/null | grep -qi "^$key$"; then
+            note "gpg .......... OK (official release key: ${who%% <*})"
+        else
+            note "gpg .......... signature valid but key not on official list"
+        fi
+    else
+        note "gpg .......... could not verify (sha256 still checked)"
+    fi
+}
+
+# ---------- install / switch ------------------------------------------------
+
+link_shims() {
+    ln -sfn ../share/node/current/bin/node "$BIN/node"
+    ln -sfn ../share/node/current/bin/npm  "$BIN/npm"
+    ln -sfn ../share/node/current/bin/npx  "$BIN/npx"
+}
+
+activate() {                       # activate <full version>
+    local v="$1"
+    ln -sfn "node-v$v-$PLAT" "$ROOT/current"
+    link_shims
+    # version-pinned shortcut: points at the specific build, NOT at 'current',
+    # so `node-24` always means 24 regardless of which version is active.
+    ln -sfn "../share/node/node-v$v-$PLAT/bin/node" "$BIN/node-${v%%.*}"
+}
+
+cmd_install() {
+    local spec="${1:-}" v dir tmp
+    [ -n "$spec" ] || die "usage: node-use install <latest|lts|major|version>"
+    need curl; need tar
+    v="$(resolve_spec "$spec")"
+
+    if [ -d "$ROOT/node-v$v-$PLAT" ]; then
+        note "Node $v already installed"
+        activate "$v"; hash -r 2>/dev/null || true
+        echo "now using Node $("$ROOT/current/bin/node" -v)"
+        return 0
+    fi
+
+    echo "Installing Node $v ($PLAT)"
+    tmp="$(mktemp -d "${TMPDIR:-/tmp}/node-use.XXXXXX")"
+    # EXIT, not RETURN: RETURN only fires on a normal function return, so a
+    # die() or a set -e abort mid-install would leak the ~32MB tarball in /tmp.
+    # Double quotes so $tmp is expanded NOW - the trap runs after this function
+    # returns, where the local variable no longer exists (and set -u would abort).
+    trap "rm -rf '$tmp'" EXIT
+    ( cd "$tmp"
+      curl -fL --progress-bar --max-time 900 -O "$DIST/v$v/node-v$v-$PLAT.tar.xz"
+      curl -fsSL --max-time 60 -O "$DIST/v$v/SHASUMS256.txt"
+      curl -fsSL --max-time 60 -O "$DIST/v$v/SHASUMS256.txt.asc" || true )
+    verify "$tmp" "$v"
+
+    mkdir -p "$ROOT"
+    tar -xJf "$tmp/node-v$v-$PLAT.tar.xz" -C "$ROOT"
+    note "extracted .... $ROOT/node-v$v-$PLAT"
+    activate "$v"
+    hash -r 2>/dev/null || true
+    echo "now using Node $("$ROOT/current/bin/node" -v), npm $("$ROOT/current/bin/npm" -v 2>/dev/null)"
+}
+
+cmd_update() {
+    local cur target
+    [ -L "$ROOT/current" ] || die "no upstream Node active - use 'node-use install latest'"
+    cur="$("$ROOT/current/bin/node" -v | tr -d v)"
+    target="$(resolve_spec "${cur%%.*}")"
+    if [ "$cur" = "$target" ]; then
+        echo "Node $cur is already the newest release on the $( echo "${cur%%.*}" ).x line"
+        local newest; newest="$(resolve_spec latest)"
+        [ "$newest" != "$cur" ] && note "newer line available: $newest  (node-use install $newest)"
+        return 0
+    fi
+    echo "$cur -> $target"
+    cmd_install "$target"
+    note "old build kept at $ROOT/node-v$cur-$PLAT  (node-use remove $cur)"
+}
+
+cmd_remove() {
+    local spec="${1:-}"
+    [ -n "$spec" ] || die "usage: node-use remove <major|version>"
+    spec="${spec#v}"
+    # accept a bare major (24) as well as a full version (24.20.0)
+    local d
+    d="$(ls -d "$ROOT"/node-v"$spec".*-"$PLAT" "$ROOT"/node-v"$spec"-"$PLAT" 2>/dev/null | head -1 || true)"
+    [ -n "$d" ] || die "not installed: $spec"
+    local b v
+    b="${d%/}"; b="${b##*/}"; v="${b#node-v}"; v="${v%-$PLAT}"
+    if [ "$(readlink "$ROOT/current" 2>/dev/null)" = "node-v$v-$PLAT" ]; then
+        die "$v is currently active - switch away first (node-use system)"
+    fi
+    rm -rf "$d"
+    # drop the per-major shortcut if it pointed into the build we just deleted
+    local shim="$BIN/node-${v%%.*}"
+    [ -L "$shim" ] && [ ! -e "$shim" ] && rm -f "$shim"
+    echo "removed $d"
+}
+
+cmd_prune() {
+    local mode="superseded" yes=0 a
+    for a in "$@"; do
+        case "$a" in
+            --all)     mode="all" ;;
+            -y|--yes)  yes=1 ;;
+            *) die "prune: unknown option $a (use --all, -y)" ;;
+        esac
+    done
+
+    compgen -G "$ROOT/node-v*-$PLAT" >/dev/null || { echo "nothing installed"; return 0; }
+
+    local active_dir active_v b v d
+    active_dir="$(readlink "$ROOT/current" 2>/dev/null || true)"
+    active_v="${active_dir#node-v}"; active_v="${active_v%-$PLAT}"
+
+    local -a all=()
+    for d in "$ROOT"/node-v*-"$PLAT"/; do
+        b="${d%/}"; b="${b##*/}"; v="${b#node-v}"; v="${v%-$PLAT}"
+        all+=("$v")
+    done
+
+    # decide what to keep
+    local -A keep=()
+    [ -n "$active_v" ] && keep["$active_v"]=1
+    if [ "$mode" = "superseded" ]; then
+        local maj newest
+        for maj in $(printf '%s\n' "${all[@]}" | cut -d. -f1 | sort -un); do
+            newest="$(printf '%s\n' "${all[@]}" | grep "^$maj\." | sort -V | tail -1)"
+            keep["$newest"]=1
+        done
+    fi
+
+    local -a doomed=()
+    for v in "${all[@]}"; do [ -n "${keep[$v]:-}" ] || doomed+=("$v"); done
+
+    if [ ${#doomed[@]} -eq 0 ]; then
+        if [ "$mode" = "superseded" ]; then
+            echo "nothing to prune - every installed build is the newest of its major line"
+            note "use 'node-use prune --all' to remove every build except the active one"
+        else
+            echo "nothing to prune - only the active build is installed"
+        fi
+        return 0
+    fi
+
+    echo "would remove:"
+    local total=0 sz
+    for v in "${doomed[@]}"; do
+        sz="$(du -sm "$ROOT/node-v$v-$PLAT" 2>/dev/null | cut -f1)"
+        total=$(( total + sz ))
+        printf "  %-12s %5s MB\n" "$v" "$sz"
+    done
+    printf "  %-12s %5s MB\n" "TOTAL" "$total"
+    echo "keeping: $(printf '%s ' "${!keep[@]}")"
+
+    if [ "$yes" != 1 ]; then
+        echo
+        note "dry run - nothing deleted. re-run with -y to remove."
+        return 0
+    fi
+    for v in "${doomed[@]}"; do
+        rm -rf "$ROOT/node-v$v-$PLAT"
+        local shim="$BIN/node-${v%%.*}"
+        [ -L "$shim" ] && [ ! -e "$shim" ] && rm -f "$shim"
+        echo "removed $v"
+    done
+}
+
+cmd_system() {
+    rm -f "$BIN/node" "$BIN/npm" "$BIN/npx"
+    hash -r 2>/dev/null || true
+    if command -v node >/dev/null 2>&1; then
+        echo "now using system Node: $(node -v) ($(command -v node))"
+    else
+        echo "shims removed; no system node found on PATH"
+    fi
+}
+
+cmd_list() {
+    echo "active: $(node -v 2>/dev/null || echo none)  ($(command -v node 2>/dev/null || echo -))"
+    echo
+    echo "upstream (~/.local/share/node):"
+    if compgen -G "$ROOT/node-v*-$PLAT" >/dev/null; then
+        local target; target="$(readlink "$ROOT/current" 2>/dev/null || true)"
+        for d in "$ROOT"/node-v*-"$PLAT"/; do
+            local b v mark; b="${d%/}"; b="${b##*/}"; v="${b#node-v}"; v="${v%-$PLAT}"
+            mark=" "; [ "$b" = "$target" ] && mark="*"
+            printf "  %s %-4s (%s)\n" "$mark" "${v%%.*}" "$v"
+        done
+    else
+        echo "    (none)"
+    fi
+    echo
+    echo "system (dnf):"
+    local found= n
+    for f in /usr/bin/node-*; do
+        [ -x "$f" ] || continue; found=1
+        n="${f##*/}"; printf "    %-4s (%s)\n" "${n#node-}" "$("$f" -v)"
+    done
+    [ -n "$found" ] || echo "    (none)"
+    echo
+    note "'*' = active upstream build.  node-use remote | install | update"
+}
+
+if [ "${1:-}" = "--refresh" ] || [ "${1:-}" = "-r" ]; then REFRESH=1; shift; fi
+
+case "${1:-}" in
+    ""|list)   cmd_list ;;
+    remote|search|available) shift; cmd_remote "${1:-recent}" ;;
+    install|add)             shift; cmd_install "${1:-}" ;;
+    update|upgrade)          cmd_update ;;
+    remove|rm|uninstall)     shift; cmd_remove "${1:-}" ;;
+    prune|clean)             shift; cmd_prune "$@" ;;
+    system)    cmd_system ;;
+    -h|--help|help) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *)
+        spec="${1#v}"
+        match="$(ls -d "$ROOT"/node-v"$spec".*-"$PLAT" "$ROOT"/node-v"$spec"-"$PLAT" 2>/dev/null | head -1 || true)"
+        [ -n "$match" ] || die "Node $spec is not installed - try 'node-use install $spec'"
+        b="${match##*/}"; v="${b#node-v}"; v="${v%-$PLAT}"
+        activate "$v"
+        echo "now using Node $("$ROOT/current/bin/node" -v) ($BIN/node), npm $("$ROOT/current/bin/npm" -v)"
+        ;;
+esac
