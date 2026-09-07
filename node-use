@@ -16,6 +16,11 @@
 #   node-use remove <version>   delete an installed upstream version
 #   node-use prune [--all] [-y] delete superseded builds (dry run unless -y)
 #
+#   node-use pm                 list installed package managers
+#   node-use pm add <pm>[@ver]  install a package manager (pnpm, yarn, ...)
+#   node-use pm remove <pm>     uninstall one
+#   node-use pm update [pm]     upgrade one, or all of them
+#
 #   -y, --yes                   assume yes; never ask for confirmation
 #   -r, --refresh               ignore the cached release index
 #
@@ -23,9 +28,13 @@
 # selected by repointing the 'current' symlink. Downloads are verified against
 # nodejs.org's SHASUMS256.txt, whose GPG signature is checked against the
 # official nodejs/release-keys list.
+#
+# Package managers live in one shared prefix, ~/.local/share/node/pm, outside
+# any Node build - so switching Node versions leaves them alone.
 set -euo pipefail
 
 ROOT="$HOME/.local/share/node"
+PM="$ROOT/pm"                                       # shared package-manager prefix
 BIN="$HOME/.local/bin"
 DIST="${NODE_USE_DIST:-https://nodejs.org/dist}"   # overridable for testing
 KEYSLIST="https://raw.githubusercontent.com/nodejs/release-keys/main/keys.list"
@@ -383,7 +392,171 @@ cmd_prune() {
     done
 }
 
+# ---------- package managers ------------------------------------------------
+
+# Package managers deliberately do NOT live inside a Node build. They go into
+# one shared prefix, so switching Node versions cannot make pnpm disappear.
+# Both are portable across versions anyway: yarn is a '#!/usr/bin/env node'
+# script that picks up whichever node is active, and pnpm ships a
+# self-contained native binary that does not need node at all.
+
+# pm_name <spec> - package name without any version suffix. A leading @ is a
+# scope, not a separator: 'pnpm@11' -> pnpm, but '@foo/bar@1' -> @foo/bar.
+pm_name() {
+    local s="${1#@}" scope=""
+    [ "$s" != "$1" ] && scope="@"
+    printf '%s%s\n' "$scope" "${s%%@*}"
+}
+
+# Names node-use owns. A package exposing one of these must not shim over it,
+# or 'pm add' could replace the node shim - or this script - with something else.
+pm_reserved() {
+    case "$1" in
+        node|npm|npx|node-use|node-[0-9]*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# pm_npm - an npm to drive. Prefers the active upstream build; falls back to
+# PATH, because 'node-use system' removes the shims and the distro npm is then
+# the only one there is.
+pm_npm() {
+    if [ -x "$ROOT/current/bin/npm" ]; then
+        printf '%s\n' "$ROOT/current/bin/npm"
+    elif command -v npm >/dev/null 2>&1; then
+        command -v npm
+    else
+        die "need npm to manage package managers (try 'node-use install lts' first)"
+    fi
+}
+
+# npm populates <prefix>/lib/node_modules and <prefix>/bin.
+pm_run() { "$(pm_npm)" --prefix "$PM" --global --no-fund --no-audit "$@" </dev/null; }
+
+# pm_installed - one 'name version' line per installed package manager
+pm_installed() {
+    [ -d "$PM/lib/node_modules" ] || return 0
+    need jq
+    "$(pm_npm)" ls --prefix "$PM" --global --depth=0 --json 2>/dev/null \
+        | jq -r '(.dependencies // {}) | to_entries[] | "\(.key) \(.value.version // "?")"'
+}
+
+# Link whatever the prefix exposes. Package names and command names do not
+# match one-to-one (pnpm brings pn/pnpx/pnx, yarn brings yarnpkg), so we link
+# what is actually in bin/ rather than guessing from the package name.
+link_pm_shims() {
+    local f n
+    [ -d "$PM/bin" ] || return 0
+    mkdir -p "$BIN"
+    for f in "$PM"/bin/*; do
+        [ -x "$f" ] || continue
+        n="${f##*/}"
+        if pm_reserved "$n"; then
+            note "not shimming '$n' - node-use owns that name" >&2
+            continue
+        fi
+        ln -sfn "../share/node/pm/bin/$n" "$BIN/$n"
+    done
+}
+
+# Drop shims into the pm prefix that no longer resolve. Uninstalling takes the
+# bin entries with it, and we do not record which package owned which command,
+# so a dangling link is the reliable signal. Same idiom as cmd_remove.
+prune_pm_shims() {
+    local f
+    for f in "$BIN"/*; do
+        [ -L "$f" ] || continue
+        case "$(readlink "$f")" in
+            ../share/node/pm/bin/*) [ -e "$f" ] || rm -f "$f" ;;
+        esac
+    done
+}
+
+pm_list() {
+    local rows name ver
+    rows="$(pm_installed)"
+    if [ -z "$rows" ]; then
+        echo "no package managers installed"
+        note "add one with:  node-use pm add pnpm"
+        return 0
+    fi
+    echo "package managers (~/.local/share/node/pm):"
+    while read -r name ver; do
+        [ -n "$name" ] || continue
+        printf "  %-10s %-12s %s\n" "$name" "$ver" "$(command -v "$name" 2>/dev/null || echo -)"
+    done <<<"$rows"
+    echo
+    note "shared across Node versions - switching node leaves these alone"
+}
+
+pm_add() {
+    local spec="${1:-}" n
+    [ -n "$spec" ] || die "usage: node-use pm add <name>[@version]   (pnpm, yarn, pnpm@11)"
+    n="$(pm_name "$spec")"
+    pm_reserved "$n" && die "'$n' is managed by node-use itself, not as a package manager"
+    echo "Installing $spec into $PM"
+    # Install scripts stay ENABLED on purpose. pnpm's postinstall hardlinks the
+    # platform binary out of its optionalDependencies; with --ignore-scripts the
+    # stub left in its place downloads that binary itself on first run, which is
+    # strictly worse - an unverified fetch at an arbitrary later moment.
+    pm_run install "$spec"
+    link_pm_shims
+    hash -r 2>/dev/null || true
+    if [ -x "$PM/bin/$n" ]; then
+        echo "now have $n $("$PM/bin/$n" --version 2>/dev/null || echo '(installed)')"
+    else
+        note "installed, but it exposed no '$n' command - see 'node-use pm'"
+    fi
+}
+
+pm_remove() {
+    local n="${1:-}"
+    [ -n "$n" ] || die "usage: node-use pm remove <name>"
+    n="$(pm_name "$n")"
+    [ -d "$PM/lib/node_modules/$n" ] || die "not installed as a package manager: $n"
+    pm_run uninstall "$n"
+    prune_pm_shims
+    hash -r 2>/dev/null || true
+    echo "removed $n"
+}
+
+pm_update() {
+    local only="${1:-}" rows name ver
+    rows="$(pm_installed)"
+    [ -n "$rows" ] || die "no package managers installed (node-use pm add pnpm)"
+    if [ -n "$only" ]; then
+        only="$(pm_name "$only")"
+        grep -q "^$only " <<<"$rows" || die "not installed as a package manager: $only"
+        rows="$(grep "^$only " <<<"$rows")"
+    fi
+    while read -r name ver; do
+        [ -n "$name" ] || continue
+        echo "$name $ver -> latest"
+        pm_run install "$name@latest"
+    done <<<"$rows"
+    link_pm_shims
+    prune_pm_shims
+    hash -r 2>/dev/null || true
+    echo
+    pm_list
+}
+
+cmd_pm() {
+    local sub="${1:-list}"
+    [ $# -gt 0 ] && shift
+    case "$sub" in
+        list|ls)             pm_list ;;
+        add|install|i)       pm_add "${1:-}" ;;
+        remove|rm|uninstall) pm_remove "${1:-}" ;;
+        update|upgrade|up)   pm_update "${1:-}" ;;
+        *) die "pm: unknown subcommand '$sub' (use: list, add, remove, update)" ;;
+    esac
+}
+
 cmd_system() {
+    # only the node shims go: the package managers in $PM keep working against
+    # the distro node (yarn resolves 'env node', pnpm's binary needs none), so
+    # handing Node back to dnf should not take pnpm away with it.
     rm -f "$BIN/node" "$BIN/npm" "$BIN/npx"
     hash -r 2>/dev/null || true
     if command -v node >/dev/null 2>&1; then
@@ -408,6 +581,18 @@ cmd_list() {
         echo "    (none)"
     fi
     echo
+    echo "package managers (pm):"
+    local pmrows; pmrows="$(pm_installed)"
+    if [ -n "$pmrows" ]; then
+        local pn pv
+        while read -r pn pv; do
+            [ -n "$pn" ] || continue
+            printf "    %-10s (%s)\n" "$pn" "$pv"
+        done <<<"$pmrows"
+    else
+        echo "    (none)"
+    fi
+    echo
     echo "system (dnf):"
     local found= n
     for f in /usr/bin/node-*; do
@@ -416,7 +601,7 @@ cmd_list() {
     done
     [ -n "$found" ] || echo "    (none)"
     echo
-    note "'*' = active upstream build.  node-use remote | install | update"
+    note "'*' = active upstream build.  node-use remote | install | update | pm"
 }
 
 # cmd_use <spec> - switch to a version, fetching it on demand.
@@ -476,6 +661,7 @@ case "${1:-}" in
     update|upgrade)          cmd_update ;;
     remove|rm|uninstall)     shift; cmd_remove "${1:-}" ;;
     prune|clean)             shift; cmd_prune "$@" ;;
+    pm|pkg)                  shift; cmd_pm "$@" ;;
     system)    cmd_system ;;
     # print the comment block down to 'set -e' rather than a fixed line range,
     # so editing the header cannot silently truncate the help
