@@ -57,7 +57,10 @@ Make sure `~/.local/bin` is on your `PATH` and that your `.bashrc` sources
 
 ```
 node-use                      list installed versions and the active one
-node-use <major|version>      switch to an installed version
+node-use <major|version>      switch to that version; if it is not installed
+                              yet, ask before downloading it
+node-use latest | lts         switch to the newest (or newest LTS) release,
+                              downloading it first if needed
 node-use system               switch back to the distro-packaged Node
 
 node-use remote [what]        list versions available on nodejs.org
@@ -68,8 +71,24 @@ node-use update               upgrade the active major to its newest release
 node-use remove <major|ver>   delete one installed version
 node-use prune [--all] [-y]   delete superseded builds (dry run unless -y)
 
+node-use --yes <cmd>          assume yes; never ask for confirmation
 node-use --refresh <cmd>      bypass the cached release index
 ```
+
+Switching implies installing. `node-use 24` on a machine with no 24.x asks
+first, because a pinned version is as likely to be a typo as an intent:
+
+```console
+$ node-use 24
+Node 24.20.0 is not installed. Download and install it now? [y/N] y
+Installing Node 24.20.0 (linux-x64)
+```
+
+`latest` and `lts` never ask — they name whatever is newest rather than a
+specific build, so fetching it *is* the answer. Non-interactive runs never
+prompt either: with no tty they refuse and point at `node-use install`, so a
+script can't be silently blocked on a question nobody will see. `--yes`
+answers up front.
 
 Examples:
 
@@ -77,7 +96,8 @@ Examples:
 node-use install lts          # newest LTS
 node-use install 24.19.0      # an exact version
 node-use remote lts           # every LTS line
-node-use 24                   # switch to the installed 24.x
+node-use latest               # newest release, downloading it if needed
+node-use 24                   # switch to 24.x, offering to fetch it
 node-use prune                # show what could be freed
 ```
 

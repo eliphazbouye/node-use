@@ -2,7 +2,10 @@
 # node-use - install and switch Node versions without a version manager.
 #
 #   node-use                    list installed versions and the active one
-#   node-use <major|version>    switch to an installed upstream version
+#   node-use <major|version>    switch to that version; if it is not installed
+#                               yet, offer to download it first
+#   node-use latest | lts       switch to the newest (or newest LTS) release,
+#                               downloading it first if needed
 #   node-use system             switch to Fedora's dnf-managed Node
 #
 #   node-use remote [what]      list versions available on nodejs.org
@@ -12,6 +15,9 @@
 #   node-use update             upgrade the active major to its newest release
 #   node-use remove <version>   delete an installed upstream version
 #   node-use prune [--all] [-y] delete superseded builds (dry run unless -y)
+#
+#   -y, --yes                   assume yes; never ask for confirmation
+#   -r, --refresh               ignore the cached release index
 #
 # Upstream builds live in ~/.local/share/node/node-v<ver>-<platform> and are
 # selected by repointing the 'current' symlink. Downloads are verified against
@@ -26,6 +32,7 @@ KEYSLIST="https://raw.githubusercontent.com/nodejs/release-keys/main/keys.list"
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/node-use"
 INDEX_TTL="${NODE_USE_TTL:-3600}"   # seconds; --refresh forces a re-fetch
 REFRESH=0
+ASSUME_YES=0
 
 case "$(uname -m)" in
     x86_64)  ARCH=x64 ;;
@@ -41,6 +48,17 @@ die()  { echo "node-use: $*" >&2; exit 1; }
 note() { echo "  $*"; }
 
 need() { command -v "$1" >/dev/null 2>&1 || die "requires '$1' but it is not installed"; }
+
+# confirm <prompt> - true if the user agreed. -y answers for them; with no tty
+# there is nobody to ask, so refuse rather than start a 30MB download unasked.
+confirm() {
+    [ "$ASSUME_YES" = 1 ] && return 0
+    [ -t 0 ] || return 1
+    local reply
+    printf '%s [y/N] ' "$1"
+    read -r reply || true
+    [[ ${reply,,} == y || ${reply,,} == yes ]]
+}
 
 # ---------- remote index ----------------------------------------------------
 
@@ -297,7 +315,7 @@ cmd_remove() {
 }
 
 cmd_prune() {
-    local mode="superseded" yes=0 a
+    local mode="superseded" yes="$ASSUME_YES" a
     for a in "$@"; do
         case "$a" in
             --all)     mode="all" ;;
@@ -401,7 +419,55 @@ cmd_list() {
     note "'*' = active upstream build.  node-use remote | install | update"
 }
 
-if [ "${1:-}" = "--refresh" ] || [ "${1:-}" = "-r" ]; then REFRESH=1; shift; fi
+# cmd_use <spec> - switch to a version, fetching it on demand.
+#
+# A local build is matched first so the common case stays offline and instant;
+# only a miss consults nodejs.org. 'latest' and 'lts' are moving aliases - you
+# asked for whatever is newest, so downloading it is the answer, not a
+# question. A pinned major or version is different: it may well be a typo, so
+# confirm before spending a download on it.
+cmd_use() {
+    local spec="${1#v}" match b v
+    match="$(ls -d "$ROOT"/node-v"$spec".*-"$PLAT" "$ROOT"/node-v"$spec"-"$PLAT" 2>/dev/null \
+             | sort -V | tail -1 || true)"
+    if [ -n "$match" ]; then
+        b="${match##*/}"; v="${b#node-v}"; v="${v%-$PLAT}"
+        activate "$v"
+        hash -r 2>/dev/null || true
+        echo "now using Node $("$ROOT/current/bin/node" -v) ($BIN/node), npm $("$ROOT/current/bin/npm" -v)"
+        return 0
+    fi
+
+    if ! [[ $spec == latest || $spec == lts \
+         || $spec =~ ^[0-9]+$ || $spec =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        die "unknown command or version '$1' (see 'node-use --help')"
+    fi
+
+    v="$(resolve_spec "$spec")"
+    # an alias can resolve onto a build we already have (node-use latest when
+    # latest is what is running); the glob above could not have known that.
+    if [ -d "$ROOT/node-v$v-$PLAT" ]; then
+        activate "$v"
+        hash -r 2>/dev/null || true
+        echo "now using Node $("$ROOT/current/bin/node" -v) ($BIN/node), npm $("$ROOT/current/bin/npm" -v)"
+        return 0
+    fi
+
+    case "$spec" in
+        latest|lts) note "Node $v is not installed yet - fetching it" ;;
+        *) confirm "Node $v is not installed. Download and install it now?" \
+               || die "not installed: $v  (node-use install $spec)" ;;
+    esac
+    cmd_install "$v"
+}
+
+while :; do
+    case "${1:-}" in
+        --refresh|-r) REFRESH=1; shift ;;
+        --yes|-y)     ASSUME_YES=1; shift ;;
+        *) break ;;
+    esac
+done
 
 case "${1:-}" in
     ""|list)   cmd_list ;;
@@ -411,13 +477,8 @@ case "${1:-}" in
     remove|rm|uninstall)     shift; cmd_remove "${1:-}" ;;
     prune|clean)             shift; cmd_prune "$@" ;;
     system)    cmd_system ;;
-    -h|--help|help) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//' ;;
-    *)
-        spec="${1#v}"
-        match="$(ls -d "$ROOT"/node-v"$spec".*-"$PLAT" "$ROOT"/node-v"$spec"-"$PLAT" 2>/dev/null | head -1 || true)"
-        [ -n "$match" ] || die "Node $spec is not installed - try 'node-use install $spec'"
-        b="${match##*/}"; v="${b#node-v}"; v="${v%-$PLAT}"
-        activate "$v"
-        echo "now using Node $("$ROOT/current/bin/node" -v) ($BIN/node), npm $("$ROOT/current/bin/npm" -v)"
-        ;;
+    # print the comment block down to 'set -e' rather than a fixed line range,
+    # so editing the header cannot silently truncate the help
+    -h|--help|help) sed -n '2,/^set -/p' "$0" | grep '^#' | sed 's/^# \{0,1\}//' ;;
+    *)         cmd_use "$1" ;;
 esac
