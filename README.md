@@ -14,6 +14,10 @@ upstream (~/.local/share/node):
     24   (24.20.0)
   * 26   (26.8.1)
 
+package managers (pm):
+    pnpm       (12.3.4)
+    yarn       (1.22.22)
+
 system (dnf):
     22   (v22.23.1)
 ```
@@ -71,6 +75,12 @@ node-use update               upgrade the active major to its newest release
 node-use remove <major|ver>   delete one installed version
 node-use prune [--all] [-y]   delete superseded builds (dry run unless -y)
 
+node-use pm                   list installed package managers
+node-use pm add <pm>[@ver]    install pnpm, yarn, or any npm-installable
+                              package manager
+node-use pm remove <pm>       uninstall one
+node-use pm update [pm]       upgrade one, or all of them
+
 node-use --yes <cmd>          assume yes; never ask for confirmation
 node-use --refresh <cmd>      bypass the cached release index
 ```
@@ -109,6 +119,49 @@ node-26 --version   # v26.8.1
 node-24 --version   # v24.20.0
 ```
 
+## Package managers
+
+Node tarballs ship `node`, `npm` and `npx` — and not much else. `corepack` used
+to be the answer here, but it is on its way out: Node 24 still bundles it,
+Node 26 no longer does. So pnpm and yarn need installing:
+
+```sh
+node-use pm add pnpm
+node-use pm add yarn
+node-use pm add pnpm@11       # pin a version
+node-use pm                   # what is installed
+node-use pm update            # upgrade all of them
+node-use pm remove yarn
+```
+
+These live in **one shared prefix** (`~/.local/share/node/pm`) outside any Node
+build, so they are installed once and survive every switch — unlike `nvm`,
+where each version gets its own globals to reinstall:
+
+```console
+$ node-use 24
+now using Node v24.20.0
+$ pnpm -v
+12.3.4          # still there
+```
+
+`pm add` takes any package manager on npm; `pnpm` and `yarn` are just the
+common ones. Commands are shimmed from whatever the package exposes, so pnpm
+also gets you `pn`, `pnpx` and `pnx`, and yarn gets `yarnpkg`. Names `node-use`
+owns (`node`, `npm`, `npx`, `node-<major>`) are never shimmed over.
+
+Two things worth knowing:
+
+- **`yarn` is Classic 1.22**, which is what npm publishes under that name. It
+  is also the normal way in to Yarn Berry — run `yarn set version stable` in a
+  project and Berry takes over there.
+- **Disk**: pnpm is ~48MB, because it now ships a self-contained native binary
+  rather than JavaScript. yarn is ~5MB.
+
+Because pnpm's binary is native it needs no Node at all, so it keeps working
+after `node-use system`. yarn is a `#!/usr/bin/env node` script, so it needs
+*some* node on `PATH` — the distro's is fine.
+
 ## How it works
 
 ```
@@ -116,10 +169,14 @@ node-24 --version   # v24.20.0
 ~/.local/share/node/current -> node-v26.8.1…  the active one
 ~/.local/bin/{node,npm,npx} -> current/bin/*  what PATH sees
 ~/.local/bin/node-26        -> the 26 build   version-pinned shortcut
+
+~/.local/share/node/pm/bin/{pnpm,yarn,…}      package managers, shared
+~/.local/bin/{pnpm,yarn,…}  -> pm/bin/*        and not tied to a version
 ```
 
-Switching repoints `current`. Selecting `system` deletes the three shims so the
-distro's `/usr/bin/node` wins on `PATH` again. Nothing is installed outside
+Switching repoints `current`. Selecting `system` deletes the three node shims so
+the distro's `/usr/bin/node` wins on `PATH` again — the package-manager shims
+stay, since they are not tied to a Node build. Nothing is installed outside
 `$HOME`, and no `sudo` is ever used.
 
 ### Verification
@@ -135,6 +192,13 @@ Every install checks, in order:
 
 A checksum mismatch is fatal. A GPG failure warns and falls back to the
 checksum, so a keyserver outage doesn't block you.
+
+This applies to **Node itself**. Package managers added with `node-use pm` come
+from the npm registry via `npm install`, so they get npm's integrity hash over
+TLS — a real check, but a weaker guarantee than the signed-checksum path above,
+and worth knowing about rather than assuming it is the same. Their install
+scripts are also left enabled on purpose: pnpm's postinstall is what puts its
+native binary in place, and blocking it only defers the download to first run.
 
 ### Why a function
 

@@ -56,3 +56,4 @@ command -v gpg >/dev/null 2>&1 || echo "note: gpg not found - installs will veri
 
 echo
 echo "Done. Open a new shell (or: . $RCD/node.sh) then run: node-use"
+echo "For pnpm/yarn:  node-use pm add pnpm"
